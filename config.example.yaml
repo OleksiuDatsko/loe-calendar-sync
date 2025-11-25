@@ -1,0 +1,4 @@
+timezone: "Europe/Kyiv"
+calendars:
+  "1.1": "primary"
+  "2.1": "ID_ВАШОГО_КАЛЕНДАРЯ@group.calendar.google.com"
