@@ -102,14 +102,16 @@ def create_visual_timeline_with_ruler(blackout_intervals):
     slots = [False] * 48
     for start, end in blackout_intervals:
         start_idx = start.hour * 2 + (1 if start.minute >= 30 else 0)
-        if end.hour == 0 and end.minute == 0 and end.day > start.day:
+        # Обробка переходу через добу
+        if end.date() > start.date() and (end.hour > 0 or end.minute > 0):
+            end_idx = 48  # Заповнюємо до кінця поточної доби
+        elif end.hour == 0 and end.minute == 0 and end.date() > start.date():
             end_idx = 48
         else:
             end_idx = end.hour * 2 + (1 if end.minute >= 30 else 0)
 
-        for i in range(start_idx, end_idx):
-            if i < 48:
-                slots[i] = True
+        for i in range(start_idx, min(end_idx, 48)):
+            slots[i] = True
 
     ruler = Text()
     bar = Text()
@@ -135,8 +137,11 @@ def create_visual_timeline_with_ruler(blackout_intervals):
 
 
 # --- ОСНОВНА ЛОГІКА ---
-def generate_calendar_for_group(group_id, target_date, text_content):
-    cal = Calendar()
+def generate_events_for_group(group_id, target_date, text_content):
+    """
+    Повертає список подій (Event) та статистику для конкретної групи та дати.
+    """
+    events = []
     group_pattern = (
         rf"Група {re.escape(group_id)}\. Електроенергії немає (.*?)(?:\n|Група|$)"
     )
@@ -158,27 +163,37 @@ def generate_calendar_for_group(group_id, target_date, text_content):
 
             total_blackout_duration += end_dt - start_dt
             blackout_intervals.append((start_dt, end_dt))
-            cal.events.add(
-                Event(
-                    name="🌑 Нема світла",
-                    begin=start_dt,
-                    end=end_dt,
-                    description=f"Група {group_id}",
-                )
+
+            # Створення події ICS
+            evt = Event(
+                name="🌑 Нема світла",
+                begin=start_dt,
+                end=end_dt,
+                description=f"Група {group_id}",
             )
+            events.append(evt)
 
     blackout_intervals.sort(key=lambda x: x[0])
 
+    # Додаємо події "Є світло" (локально, не для експорту в Google, якщо не треба)
+    # Але для візуалізації і ics файлу ми зазвичай додаємо і позитивні події
     day_start = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=TZ)
     day_end = day_start + timedelta(days=1)
     current_time = day_start
 
+    positive_events = []
     for b_start, b_end in blackout_intervals:
         if current_time < b_start:
-            cal.events.add(Event(name="💡 Є світло", begin=current_time, end=b_start))
+            positive_events.append(
+                Event(name="💡 Є світло", begin=current_time, end=b_start)
+            )
         current_time = max(current_time, b_end)
     if current_time < day_end:
-        cal.events.add(Event(name="💡 Є світло", begin=current_time, end=day_end))
+        positive_events.append(
+            Event(name="💡 Є світло", begin=current_time, end=day_end)
+        )
+
+    events.extend(positive_events)
 
     visual_group = create_visual_timeline_with_ruler(blackout_intervals)
     current_signature = get_intervals_signature(blackout_intervals)
@@ -194,7 +209,7 @@ def generate_calendar_for_group(group_id, target_date, text_content):
         "total_off": total_blackout_duration,
         "percent_off": percent_off,
     }
-    return cal, statistics
+    return events, statistics
 
 
 def print_historical_stats():
@@ -250,7 +265,10 @@ def main():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
-    state = load_json(STATE_FILE)
+    prev_state = load_json(STATE_FILE)
+    # Підтримка старої структури для сумісності при першому запуску нової версії
+    if "groups" in prev_state and not "dates" in prev_state:
+        prev_state = {"dates": [], "groups": {}}
 
     with console.status("[bold green]Отримання даних...", spinner="dots"):
         page_text = ""
@@ -285,72 +303,93 @@ def main():
         except ValueError:
             continue
 
-    schedules.sort(key=lambda x: x[0], reverse=True)
-    target_date, target_text = schedules[0]
-    target_date_str = target_date.strftime("%Y-%m-%d")
+    # Сортуємо від найстарішої до найновішої дати для послідовного виводу
+    schedules.sort(key=lambda x: x[0])
 
-    update_match = re.search(r"Інформація станом на\s+(.*?)(?:\n|$)", target_text)
+    # Зберігаємо загальні календарі для кожної групи (акумулюємо всі дні)
+    group_calendars = {g: Calendar() for g in ALL_GROUPS}
+
+    # Новий стан: список дат і підписи для кожної групи на кожну дату
+    new_state = {"dates": [], "groups": {g: {} for g in ALL_GROUPS}}
+
+    # Знаходимо час оновлення (зазвичай він один на сторінці зверху, або біля кожного графіку)
+    # Для простоти візьмемо з першого знайденого блоку або глобальний
+    update_match = re.search(r"Інформація станом на\s+(.*?)(?:\n|$)", page_text)
     last_updated = update_match.group(1).strip() if update_match else "Невідомо"
 
-    console.print(
-        f"\n📅 [bold cyan]Дата графіку:[/bold cyan] {target_date}  |  🕒 [dim]Оновлено: {last_updated}[/dim]\n"
-    )
+    console.print(f"\n🕒 [dim]Оновлено на сайті: {last_updated}[/dim]\n")
 
-    table = Table(
-        title="Графік на сьогодні (4-годинна сітка)",
-        box=box.ROUNDED,
-        pad_edge=False,
-        show_lines=True,
-    )
+    for target_date, target_text in schedules:
+        target_date_str = target_date.strftime("%Y-%m-%d")
+        new_state["dates"].append(target_date_str)
 
-    table.add_column("Група", justify="center", style="cyan bold", no_wrap=True)
-    table.add_column("Візуалізація", justify="left")
-    table.add_column("Години", style="white")
-    table.add_column("Сьогодні", justify="right")
-    table.add_column("Статус", justify="center")
+        console.print(
+            f"📅 [bold cyan]Графік на: {target_date.strftime('%d.%m.%Y')}[/bold cyan]"
+        )
 
-    new_state = {"date": target_date_str, "groups": {}}
+        table = Table(
+            title=f"Розклад ({target_date.strftime('%A')})",
+            box=box.ROUNDED,
+            pad_edge=False,
+            show_lines=True,
+        )
 
-    for group in ALL_GROUPS:
-        cal, stats = generate_calendar_for_group(group, target_date, target_text)
+        table.add_column("Група", justify="center", style="cyan bold", no_wrap=True)
+        table.add_column("Візуалізація", justify="left")
+        table.add_column("Години", style="white")
+        table.add_column("Вимкнення", justify="right")
+        table.add_column("Статус", justify="center")
 
+        for group in ALL_GROUPS:
+            events, stats = generate_events_for_group(group, target_date, target_text)
+
+            # Додаємо події до загального календаря групи
+            for e in events:
+                group_calendars[group].events.add(e)
+
+            sig = stats["intervals_signature"]
+            new_state["groups"][group][target_date_str] = sig
+
+            update_history(
+                target_date_str,
+                group,
+                stats["total_off"].total_seconds(),
+                stats["intervals_list"],
+            )
+
+            # Порівняння змін з попереднім станом для цієї конкретної дати
+            prev_sig = (
+                prev_state.get("groups", {}).get(group, {}).get(target_date_str, "")
+            )
+
+            status_str = "[dim]Без змін[/dim]"
+            if target_date_str not in prev_state.get("dates", []):
+                status_str = "[bold blue]Новий день[/]"
+            elif prev_sig != sig:
+                status_str = "[bold red blink]⚠️ ЗМІНА![/]"
+
+            pct = stats["percent_off"]
+            color = "red" if pct > 50 else ("yellow" if pct > 30 else "green")
+            stats_text = f"{format_timedelta_hours(stats['total_off'])}\n[{color}]{pct:.0f}% доби[/]"
+
+            table.add_row(
+                group,
+                stats["visual_group"],
+                stats["intervals_display_str"],
+                stats_text,
+                status_str,
+            )
+
+        console.print(table)
+        console.print("")  # Відступ між таблицями
+
+    # Збереження .ics файлів
+    for group, cal in group_calendars.items():
         with open(
             os.path.join(OUTPUT_DIR, f"group_{group}.ics"), "w", encoding="utf-8"
         ) as f:
             f.writelines(cal.serialize_iter())
 
-        sig = stats["intervals_signature"]
-        new_state["groups"][group] = sig
-
-        update_history(
-            target_date_str,
-            group,
-            stats["total_off"].total_seconds(),
-            stats["intervals_list"],
-        )
-
-        prev_date = state.get("date")
-        status_str = "[dim]Без змін[/dim]"
-        if prev_date != target_date_str:
-            status_str = "[bold blue]Новий день[/]"
-        elif state.get("groups", {}).get(group) != sig:
-            status_str = "[bold red blink]⚠️ ЗМІНА![/]"
-
-        pct = stats["percent_off"]
-        color = "red" if pct > 50 else ("yellow" if pct > 30 else "green")
-        stats_text = (
-            f"{format_timedelta_hours(stats['total_off'])}\n[{color}]{pct:.0f}% доби[/]"
-        )
-
-        table.add_row(
-            group,
-            stats["visual_group"],
-            stats["intervals_display_str"],
-            stats_text,
-            status_str,
-        )
-
-    console.print(table)
     save_json(STATE_FILE, new_state)
 
     print_historical_stats()
